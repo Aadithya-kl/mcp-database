@@ -1,6 +1,7 @@
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import type { Adapter, ExecuteResult, Limits, Param, QueryResult, TableDescription, TableSummary } from "../types.js";
 import { toJsonRow } from "../serialize.js";
+import { SqliteQueryRunner } from "./sqlite-runner.js";
 
 export interface SqliteOptions {
   path: string;
@@ -15,8 +16,13 @@ function bind(params: Param[]): SQLInputValue[] {
  * SQLite adapter backed by the built-in `node:sqlite` module (no native addon to compile).
  *
  * Read-only is enforced twice: the file is opened with `readOnly: true`
- * and `PRAGMA query_only = ON` is set. SQLite executes synchronously, so a
- * statement cannot be interrupted by a timeout — the row cap bounds memory instead.
+ * and `PRAGMA query_only = ON` is set.
+ *
+ * `node:sqlite` runs a statement synchronously and cannot interrupt it, so
+ * `query` runs in a child process ({@link SqliteQueryRunner}) that is killed
+ * when the statement timeout passes. Schema tools and `execute` stay in
+ * process. An in-memory database only exists in this process, so its queries
+ * also run here, without a timeout.
  */
 export class SqliteAdapter implements Adapter {
   readonly dialect = "sqlite" as const;
@@ -24,6 +30,7 @@ export class SqliteAdapter implements Adapter {
   private constructor(
     private readonly opts: SqliteOptions,
     private readonly db: DatabaseSync,
+    private readonly runner: SqliteQueryRunner | null,
   ) {}
 
   /** `node:sqlite` is loaded lazily so PostgreSQL / MySQL users never trigger its experimental-feature warning. */
@@ -32,11 +39,16 @@ export class SqliteAdapter implements Adapter {
     const inMemory = opts.path === ":memory:";
     const db = new Database(opts.path, { readOnly: !opts.writable && !inMemory });
     if (!opts.writable) db.exec("PRAGMA query_only = ON");
-    return new SqliteAdapter(opts, db);
+    return new SqliteAdapter(opts, db, inMemory ? null : new SqliteQueryRunner(opts.path));
   }
 
   async ping(): Promise<void> {
     this.db.prepare("SELECT 1").get();
+  }
+
+  /** Process id of the query process, if one is running. Used by tests. */
+  get queryProcessId(): number | undefined {
+    return this.runner?.pid;
   }
 
   quoteIdent(name: string): string {
@@ -115,6 +127,15 @@ export class SqliteAdapter implements Adapter {
 
   async query(sql: string, params: Param[], limits: Limits): Promise<QueryResult> {
     const started = performance.now();
+    if (this.runner) {
+      const result = await this.runner.run(sql, bind(params), limits.maxRows, limits.timeoutMs);
+      return {
+        columns: result.columns,
+        rows: result.rows.map((row) => toJsonRow(row)),
+        truncated: result.truncated,
+        durationMs: Math.round(performance.now() - started),
+      };
+    }
     const stmt = this.db.prepare(sql);
     stmt.setReadBigInts(true);
     // Arrays (not objects) so that duplicate column names such as `a.id, b.id` survive.
@@ -144,6 +165,7 @@ export class SqliteAdapter implements Adapter {
   }
 
   async close(): Promise<void> {
+    await this.runner?.close();
     this.db.close();
   }
 }
