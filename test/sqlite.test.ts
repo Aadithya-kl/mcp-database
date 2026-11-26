@@ -30,10 +30,18 @@ beforeAll(() => {
 
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
-async function open(opts: { writable?: boolean; allowDdl?: boolean; maxRows?: number } = {}): Promise<Harness> {
+async function open(opts: { writable?: boolean; allowDdl?: boolean; maxRows?: number; timeoutMs?: number } = {}): Promise<Harness> {
   const adapter = await SqliteAdapter.open({ path: file, writable: opts.writable ?? false });
-  return connect(adapter, { allowWrites: opts.writable ?? false, allowDdl: opts.allowDdl ?? false, maxRows: opts.maxRows ?? 200 });
+  return connect(adapter, {
+    allowWrites: opts.writable ?? false,
+    allowDdl: opts.allowDdl ?? false,
+    maxRows: opts.maxRows ?? 200,
+    timeoutMs: opts.timeoutMs ?? 15_000,
+  });
 }
+
+// Never terminates and never yields a row, so the row cap cannot stop it either.
+const RUNAWAY_CTE = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c";
 
 describe("sqlite: read-only mode", () => {
   it("exposes only read tools", async () => {
@@ -137,6 +145,44 @@ describe("sqlite: read-only mode", () => {
     await expect(adapter.query("PRAGMA query_only = OFF", [], { maxRows: 10, timeoutMs: 1000 }).then(() =>
       adapter.query("DELETE FROM users", [], { maxRows: 10, timeoutMs: 1000 }),
     )).rejects.toThrow(/readonly|read-only|read only/i);
+    await adapter.close();
+  });
+});
+
+describe("sqlite: query timeout", () => {
+  it("cancels a recursive CTE that never ends and keeps serving queries", async () => {
+    const h = await open({ timeoutMs: 500 });
+    const started = performance.now();
+    const res = await h.call("query", { sql: RUNAWAY_CTE });
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/Query cancelled: it ran longer than the 500 ms timeout/);
+    expect(performance.now() - started).toBeLessThan(5_000);
+
+    expect((await h.call("query", { sql: "SELECT count(*) FROM users" })).data.rows).toEqual([[500]]);
+    await h.close();
+  }, 20_000);
+
+  it("runs queued queries after one times out", async () => {
+    const adapter = await SqliteAdapter.open({ path: file, writable: false });
+    const limits = { maxRows: 10, timeoutMs: 300 };
+    const [slow, fast] = await Promise.allSettled([
+      adapter.query(RUNAWAY_CTE, [], limits),
+      adapter.query("SELECT email FROM users WHERE id = ?", [3], limits),
+    ]);
+    expect(slow.status).toBe("rejected");
+    expect(fast).toMatchObject({ status: "fulfilled", value: { rows: [["u3@example.com"]] } });
+
+    // The recreated connection is still read-only.
+    expect((await adapter.query("PRAGMA query_only", [], limits)).rows).toEqual([[1]]);
+    await expect(adapter.query("DELETE FROM users WHERE id = 1", [], limits)).rejects.toThrow(/readonly|read-only|read only/i);
+    await adapter.close();
+  }, 20_000);
+
+  it("reads through a read-only connection even when writes are enabled (guard bypassed)", async () => {
+    const adapter = await SqliteAdapter.open({ path: file, writable: true });
+    await expect(adapter.query("DELETE FROM users WHERE id = 1", [], { maxRows: 10, timeoutMs: 1000 })).rejects.toThrow(
+      /readonly|read-only|read only/i,
+    );
     await adapter.close();
   });
 });
