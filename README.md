@@ -78,7 +78,7 @@ Three independent layers, so no single bug is fatal:
 2. **Engine-level read-only.**
    - PostgreSQL: `BEGIN READ ONLY` + `SET LOCAL statement_timeout`, results streamed through a cursor.
    - MySQL: `SET SESSION TRANSACTION READ ONLY` + `START TRANSACTION READ ONLY` + `MAX_EXECUTION_TIME`. (The session-level setting matters: MySQL DDL commits implicitly and would otherwise escape a plain read-only transaction. This is covered by a test.)
-   - SQLite: the file is opened `readOnly` and `PRAGMA query_only = ON`.
+   - SQLite: the file is opened `readOnly` and `PRAGMA query_only = ON`. Queries run in a separate process with its own connection opened the same way (also when `--read-write` is set), which is killed on timeout.
 3. **Your database account.** The guard and read-only mode are defences, not a substitute for least privilege. Connect with a role that can only read what the model should see.
 
 Errors are scrubbed of the connection string and password before they reach the model, and the server never logs to stdout (reserved for the protocol).
@@ -100,7 +100,7 @@ GRANT SELECT ON mydb.* TO 'mcp_readonly'@'%';
 
 ## Known limits
 
-- **SQLite has no query timeout.** `node:sqlite` runs synchronously and cannot interrupt a statement; a runaway recursive CTE blocks the server. The row cap bounds memory, not time.
+- **SQLite timeouts cover `query` and `sample_rows` only.** `node:sqlite` runs synchronously and cannot interrupt a statement, so reads run in a separate Node.js process that is killed when `--timeout-ms` is exceeded (a fresh read-only connection is opened for the next query). Schema tools and `execute` still run in-process without a timeout, and `:memory:` databases (which another process cannot open) have no query timeout.
 - **MySQL buffers a result set before the row cap is applied** (`mysql2` has no server-side cursor). Keep a `LIMIT` in large queries. `MAX_EXECUTION_TIME` bounds time.
 - Only the first statement type is classified; the engine-level read-only layer is what ultimately prevents writes through exotic constructs.
 - `EXPLAIN ANALYZE` actually executes the statement. It is classified by the statement it wraps, and in read-only mode a wrapped write is rejected.
