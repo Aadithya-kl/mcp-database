@@ -263,3 +263,18 @@ describe("sqlite: statement timeout", () => {
     expect(isAlive(pid)).toBe(false);
   });
 });
+
+describe("sqlite: query process start-up", () => {
+  it("reports a failed open and retries on the next query", async () => {
+    const path = join(dir, "will-be-removed.db");
+    new DatabaseSync(path).close();
+    const adapter = await SqliteAdapter.open({ path, writable: false });
+    rmSync(path);
+    await expect(adapter.query("SELECT 1", [], { maxRows: 10, timeoutMs: 5000 })).rejects.toThrow(/unable to open|no such file/i);
+    expect(adapter.queryProcessId).toBeUndefined();
+    new DatabaseSync(path).close();
+    const res = await adapter.query("SELECT 1", [], { maxRows: 10, timeoutMs: 5000 });
+    expect(res.rows).toEqual([[1]]);
+    await adapter.close();
+  });
+});

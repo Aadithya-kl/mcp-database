@@ -111,22 +111,43 @@ export class SqliteQueryRunner {
       serialization: "advanced",
     });
     this.child = child;
+    // Never keep the server alive just because a query process exists; pending
+    // request timers keep the event loop running while a query is in flight.
+    child.unref();
+    child.channel?.unref();
+    // A child stuck in a native call cannot notice that its parent went away,
+    // so kill it on any exit path, including process.exit() after a crash handler.
+    const killOnExit = () => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    };
+    process.once("exit", killOnExit);
+    child.once("exit", () => process.removeListener("exit", killOnExit));
     child.on("message", (reply: Reply) => {
       const waiter = this.pending.get(reply.id);
       if (!waiter) return;
       this.pending.delete(reply.id);
       waiter.resolve(reply);
     });
+    // Only the current process may fail pending requests: a process that was
+    // already replaced (after a timeout) can report its exit after the new one started.
     child.on("exit", () => {
-      if (this.child === child) this.child = null;
+      if (this.child !== child) return;
+      this.child = null;
       this.failPending(new Error("SQLite query process exited unexpectedly."));
     });
     child.on("error", (err) => {
-      if (this.child === child) this.child = null;
+      if (this.child !== child) return;
+      this.child = null;
       this.failPending(err);
     });
     // Opening a local file is fast; the generous limit only guards against a stuck spawn.
-    await this.request({ type: "open", path: this.path }, 10_000);
+    try {
+      await this.request({ type: "open", path: this.path }, 10_000);
+    } catch (err) {
+      // Do not keep a process with no open database: the next query starts a new one.
+      this.kill(null);
+      throw err;
+    }
   }
 
   private request(message: Record<string, unknown>, timeoutMs: number): Promise<Reply> {
