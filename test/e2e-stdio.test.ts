@@ -72,6 +72,27 @@ describe("cli over stdio", () => {
     }
   }, 30_000);
 
+  it("cancels a runaway SQLite query after --timeout-ms", async () => {
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [bin, "--timeout-ms", "500"],
+      env: { PATH: process.env.PATH ?? "", DATABASE_URL: file },
+    });
+    const client = new Client({ name: "e2e", version: "1.0.0" });
+    await client.connect(transport);
+    try {
+      const sql = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c";
+      const res = await client.callTool({ name: "query", arguments: { sql } });
+      expect(res.isError).toBe(true);
+      expect((res.content as Array<{ text: string }>)[0]!.text).toMatch(/timeout/);
+
+      const after = await client.callTool({ name: "query", arguments: { sql: "SELECT count(*) FROM t" } });
+      expect(JSON.parse((after.content as Array<{ text: string }>)[0]!.text).rows).toEqual([[2]]);
+    } finally {
+      await client.close();
+    }
+  }, 30_000);
+
   it("fails fast without leaking the password", () => {
     const run = spawnSync(process.execPath, [bin], {
       env: { PATH: process.env.PATH ?? "", DATABASE_URL: "postgres://bob:hunter2@127.0.0.1:1/nope" },
