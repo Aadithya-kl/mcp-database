@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- SQLite: `query` and `sample_rows` now honour `--timeout-ms`. They run in a separate read-only process that is killed when the timeout is exceeded, so a runaway query (e.g. a recursive CTE that never ends) no longer blocks the server (#2).
+
 ## 0.1.0
 
 Initial release.
