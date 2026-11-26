@@ -188,3 +188,93 @@ describe("sqlite: in-memory", () => {
     await h.close();
   });
 });
+
+describe("sqlite: statement timeout", () => {
+  const RUNAWAY = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c";
+
+  function isAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("stops a runaway query, kills its process and keeps serving", async () => {
+    const adapter = await SqliteAdapter.open({ path: file, writable: false });
+    const h = await connect(adapter, { timeoutMs: 500 });
+
+    expect((await h.call("query", { sql: "SELECT count(*) FROM users" })).data.rows).toEqual([[500]]);
+    const firstPid = adapter.queryProcessId!;
+    expect(firstPid).toBeTypeOf("number");
+
+    const started = Date.now();
+    const res = await h.call("query", { sql: RUNAWAY });
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/stopped after the 500 ms timeout/);
+    expect(Date.now() - started).toBeLessThan(3000);
+
+    // The old process is really gone, not just abandoned.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(isAlive(firstPid)).toBe(false);
+
+    // The next query starts a fresh process and works.
+    expect((await h.call("query", { sql: "SELECT email FROM users WHERE id = ?", params: [2] })).data.rows).toEqual([["u2@example.com"]]);
+    expect(adapter.queryProcessId).not.toBe(firstPid);
+    await h.close();
+  });
+
+  it("keeps schema tools responsive while a query is running", async () => {
+    const adapter = await SqliteAdapter.open({ path: file, writable: false });
+    const h = await connect(adapter, { timeoutMs: 1500 });
+    const runaway = h.call("query", { sql: RUNAWAY });
+    const started = Date.now();
+    const tables = (await h.call("list_tables")).data.tables as unknown[];
+    expect(tables).toHaveLength(3);
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect((await runaway).isError).toBe(true);
+    await h.close();
+  });
+
+  it("runs concurrent queries in order and returns each result", async () => {
+    const adapter = await SqliteAdapter.open({ path: file, writable: false });
+    const h = await connect(adapter);
+    const results = await Promise.all(
+      [1, 2, 3, 4, 5].map((id) => h.call("query", { sql: "SELECT id FROM users WHERE id = ?", params: [id] })),
+    );
+    expect(results.map((r) => r.data.rows)).toEqual([[[1]], [[2]], [[3]], [[4]], [[5]]]);
+    await h.close();
+  });
+
+  it("still refuses writes inside the query process", async () => {
+    const adapter = await SqliteAdapter.open({ path: file, writable: false });
+    // Call the adapter directly to skip the SQL guard and test the engine-level layer.
+    await expect(adapter.query("DELETE FROM users", [], { maxRows: 10, timeoutMs: 5000 })).rejects.toThrow(/readonly|read-only|query_only/i);
+    await adapter.close();
+  });
+
+  it("ends the query process on close", async () => {
+    const adapter = await SqliteAdapter.open({ path: file, writable: false });
+    await adapter.query("SELECT 1", [], { maxRows: 10, timeoutMs: 5000 });
+    const pid = adapter.queryProcessId!;
+    await adapter.close();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(isAlive(pid)).toBe(false);
+  });
+});
+
+describe("sqlite: query process start-up", () => {
+  it("reports a failed open and retries on the next query", async () => {
+    const path = join(dir, "will-be-removed.db");
+    new DatabaseSync(path).close();
+    const adapter = await SqliteAdapter.open({ path, writable: false });
+    rmSync(path);
+    await expect(adapter.query("SELECT 1", [], { maxRows: 10, timeoutMs: 5000 })).rejects.toThrow(/unable to open|no such file/i);
+    expect(adapter.queryProcessId).toBeUndefined();
+    new DatabaseSync(path).close();
+    const res = await adapter.query("SELECT 1", [], { maxRows: 10, timeoutMs: 5000 });
+    expect(res.rows).toEqual([[1]]);
+    await adapter.close();
+  });
+});
