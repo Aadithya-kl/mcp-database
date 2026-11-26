@@ -1,6 +1,8 @@
+import { resolve } from "node:path";
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import type { Adapter, ExecuteResult, Limits, Param, QueryResult, TableDescription, TableSummary } from "../types.js";
 import { toJsonRow } from "../serialize.js";
+import { SqliteQueryRunner, type RawRows } from "./sqlite-runner.js";
 
 export interface SqliteOptions {
   path: string;
@@ -15,16 +17,22 @@ function bind(params: Param[]): SQLInputValue[] {
  * SQLite adapter backed by the built-in `node:sqlite` module (no native addon to compile).
  *
  * Read-only is enforced twice: the file is opened with `readOnly: true`
- * and `PRAGMA query_only = ON` is set. SQLite executes synchronously, so a
- * statement cannot be interrupted by a timeout — the row cap bounds memory instead.
+ * and `PRAGMA query_only = ON` is set. SQLite executes synchronously, so
+ * `query` runs in a separate process (also read-only) that is killed when the
+ * statement timeout is exceeded. `:memory:` databases cannot be shared with
+ * another process, so their queries run in-process without a timeout.
  */
 export class SqliteAdapter implements Adapter {
   readonly dialect = "sqlite" as const;
 
+  private readonly runner: SqliteQueryRunner | null;
+
   private constructor(
     private readonly opts: SqliteOptions,
     private readonly db: DatabaseSync,
-  ) {}
+  ) {
+    this.runner = opts.path === ":memory:" ? null : new SqliteQueryRunner(resolve(opts.path));
+  }
 
   /** `node:sqlite` is loaded lazily so PostgreSQL / MySQL users never trigger its experimental-feature warning. */
   static async open(opts: SqliteOptions): Promise<SqliteAdapter> {
@@ -115,21 +123,10 @@ export class SqliteAdapter implements Adapter {
 
   async query(sql: string, params: Param[], limits: Limits): Promise<QueryResult> {
     const started = performance.now();
-    const stmt = this.db.prepare(sql);
-    stmt.setReadBigInts(true);
-    // Arrays (not objects) so that duplicate column names such as `a.id, b.id` survive.
-    stmt.setReturnArrays(true);
-    const columns = stmt.columns().map((c) => c.name);
-    const rows: unknown[][] = [];
-    let truncated = false;
-    for (const row of stmt.iterate(...bind(params)) as Iterable<unknown[]>) {
-      if (rows.length >= limits.maxRows) {
-        truncated = true;
-        break;
-      }
-      rows.push(toJsonRow(row));
-    }
-    return { columns, rows, truncated, durationMs: Math.round(performance.now() - started) };
+    const { columns, rows, truncated } = this.runner
+      ? await this.runner.query(sql, bind(params), limits)
+      : queryInProcess(this.db, sql, bind(params), limits.maxRows);
+    return { columns, rows: rows.map(toJsonRow), truncated, durationMs: Math.round(performance.now() - started) };
   }
 
   async execute(sql: string, params: Param[], _limits: Limits): Promise<ExecuteResult> {
@@ -144,6 +141,26 @@ export class SqliteAdapter implements Adapter {
   }
 
   async close(): Promise<void> {
+    this.runner?.close();
     this.db.close();
   }
+}
+
+/** Same as the query runner's child process, but on this thread (used for `:memory:`). */
+function queryInProcess(db: DatabaseSync, sql: string, params: SQLInputValue[], maxRows: number): RawRows {
+  const stmt = db.prepare(sql);
+  stmt.setReadBigInts(true);
+  // Arrays (not objects) so that duplicate column names such as `a.id, b.id` survive.
+  stmt.setReturnArrays(true);
+  const columns = stmt.columns().map((c) => c.name);
+  const rows: unknown[][] = [];
+  let truncated = false;
+  for (const row of stmt.iterate(...params) as Iterable<unknown[]>) {
+    if (rows.length >= maxRows) {
+      truncated = true;
+      break;
+    }
+    rows.push(row);
+  }
+  return { columns, rows, truncated };
 }
